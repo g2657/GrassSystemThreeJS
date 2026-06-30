@@ -3,6 +3,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import GUI from 'lil-gui';
 import { createPostFX } from './postfx.js';
+import { createGrass } from './grass.js';
 
 /* -------------------------------------------------------------------------- */
 /*  Renderer                                                                   */
@@ -159,9 +160,10 @@ const soilUniforms = {
   uSoilColor: { value: new THREE.Color(0xffffff) }, // overall tint multiplier
   uVarScale: { value: 0.08 }, // tone-variation frequency
   uVarAmount: { value: 0.28 }, // dry/rich tone contrast
-  uMoisture: { value: 0.0 }, // 0 = bone dry, 1 = soaked
+  uMoisture: { value: 0.0 }, // 0 = bone dry, 1 = soaked (fully covered)
   uMoistScale: { value: 0.18 }, // damp-patch frequency
   uMoistEdge: { value: 0.12 }, // damp-patch edge softness
+  uMoistSeed: { value: new THREE.Vector2(5.0, 5.0) }, // pan the damp field
   uWetDarken: { value: 0.5 }, // how much wet soil darkens
   uWetRoughness: { value: 0.35 }, // wet soil is glossier
   uCrackAmount: { value: 0.0 }, // dry-earth fissures
@@ -210,26 +212,15 @@ float fbm(vec2 p) {
 }
 `;
 
-// Soil uniforms (declared for BOTH shader stages) + the height field used by the
-// vertex stage and the normal-shading helper used by the fragment stage.
-const SOIL_FUNCTIONS = /* glsl */ `
+// Terrain height field — SHARED by the soil material AND the grass (so blades
+// sit exactly on the displaced ground, live, as the mound sliders move). Only
+// the shaping uniforms it needs are declared here.
+const HEIGHT_FUNCTIONS = /* glsl */ `
 uniform float uMoundScale;
 uniform vec2  uSeed;
 uniform float uMoundDepth;
 uniform float uBumpScale;
 uniform float uBumpStrength;
-uniform vec3  uSoilColor;
-uniform float uVarScale;
-uniform float uVarAmount;
-uniform float uMoisture;
-uniform float uMoistScale;
-uniform float uMoistEdge;
-uniform float uWetDarken;
-uniform float uWetRoughness;
-uniform float uCrackAmount;
-uniform float uCrackScale;
-uniform float uReliefShading;
-uniform float uTime;
 
 // Height of the soil surface above the flat plane, in world units. Broad mounds
 // modulated by finer lumps. Tapered to zero near the plane rim (half-extent 10)
@@ -242,6 +233,23 @@ float groundHeightAt(vec2 worldXZ) {
   vec2 edge = smoothstep(10.0, 8.0, abs(worldXZ));
   return uMoundDepth * h * edge.x * edge.y;
 }
+`;
+
+// Soil-only shading uniforms + the normal-shading helper (fragment stage).
+const SOIL_SHADE_FUNCTIONS = /* glsl */ `
+uniform vec3  uSoilColor;
+uniform float uVarScale;
+uniform float uVarAmount;
+uniform float uMoisture;
+uniform float uMoistScale;
+uniform float uMoistEdge;
+uniform vec2  uMoistSeed;
+uniform float uWetDarken;
+uniform float uWetRoughness;
+uniform float uCrackAmount;
+uniform float uCrackScale;
+uniform float uReliefShading;
+uniform float uTime;
 
 // Analytic surface normal of the displaced ground (for shading the slopes).
 vec3 groundSurfaceNormal(vec2 worldXZ) {
@@ -254,7 +262,7 @@ vec3 groundSurfaceNormal(vec2 worldXZ) {
 }
 `;
 
-const SOIL_INJECT = NOISE_FUNCTIONS + SOIL_FUNCTIONS;
+const SOIL_INJECT = NOISE_FUNCTIONS + HEIGHT_FUNCTIONS + SOIL_SHADE_FUNCTIONS;
 
 material.onBeforeCompile = (shader) => {
   Object.assign(shader.uniforms, soilUniforms);
@@ -290,9 +298,10 @@ material.onBeforeCompile = (shader) => {
       diffuseColor.rgb *= uSoilColor;
 
       // Moisture: damp patches darken the soil (used again in the rough stage).
-      float wn  = fbm(sXZ * uMoistScale + 5.0) * 0.5 + 0.5;
-      float wet = smoothstep(1.0 - uMoisture - uMoistEdge,
-                             1.0 - uMoisture + uMoistEdge, wn);
+      // Coverage maps 0 -> dry everywhere, 1 -> damp everywhere (full coverage).
+      float wn  = fbm(sXZ * uMoistScale + uMoistSeed) * 0.5 + 0.5;
+      float wThresh = mix(1.0 + uMoistEdge, -uMoistEdge, uMoisture);
+      float wet = smoothstep(wThresh - uMoistEdge, wThresh + uMoistEdge, wn);
       diffuseColor.rgb *= mix(1.0, uWetDarken, wet);
 
       // Dry cracks: dark fissures where the noise crosses zero.
@@ -331,6 +340,41 @@ plane.rotation.x = -Math.PI / 2;
 plane.receiveShadow = true;
 plane.castShadow = true;
 scene.add(plane);
+
+/* -------------------------------------------------------------------------- */
+/*  Wind field (shared by the grass; world-space gust direction & speed)       */
+/* -------------------------------------------------------------------------- */
+const windUniforms = {
+  uWindDir: { value: new THREE.Vector2(1, 0.35).normalize() },
+  uWindStrength: { value: 0.5 }, // how far the gust leans the blades
+  uWindSpeed: { value: 1.8 }, // travel speed of the gust front
+  uWindScale: { value: 0.35 }, // spatial frequency of the gust field
+  uGust: { value: 0.6 }, // fine per-blade flutter amount
+};
+const windState = { strength: 0.5, speed: 1.8, scale: 0.35, gust: 0.6, direction: 20 };
+function applyWind() {
+  const a = THREE.MathUtils.degToRad(windState.direction);
+  windUniforms.uWindDir.value.set(Math.cos(a), Math.sin(a)); // already unit-length
+  windUniforms.uWindStrength.value = windState.strength;
+  windUniforms.uWindSpeed.value = windState.speed;
+  windUniforms.uWindScale.value = windState.scale;
+  windUniforms.uGust.value = windState.gust;
+}
+applyWind();
+
+/* -------------------------------------------------------------------------- */
+/*  Grass — GPU-instanced, wind-reactive, curlable, glued to the terrain       */
+/* -------------------------------------------------------------------------- */
+const grass = createGrass({
+  sharedUniforms: shared,
+  soilUniforms, // shares the terrain height field (blades follow the mounds)
+  windUniforms,
+  noiseGLSL: NOISE_FUNCTIONS,
+  heightGLSL: HEIGHT_FUNCTIONS,
+  sunLight: keyLight,
+  area: 19,
+});
+scene.add(grass.mesh);
 
 /* -------------------------------------------------------------------------- */
 /*  Cinematic post-processing & camera                                         */
@@ -498,9 +542,23 @@ fLook.add(soilUniforms.uVarAmount, 'value', 0, 1, 0.01).name('Tone Variation');
 fLook.add(soilUniforms.uVarScale, 'value', 0.01, 0.5, 0.001).name('Variation Scale');
 
 const fWet = fSoil.addFolder('Moisture');
-fWet.add(soilUniforms.uMoisture, 'value', 0, 1, 0.01).name('Moisture');
+fWet.add(soilUniforms.uMoisture, 'value', 0, 1, 0.01).name('Coverage');
 fWet.add(soilUniforms.uMoistEdge, 'value', 0.001, 0.4, 0.001).name('Patch Softness');
 fWet.add(soilUniforms.uMoistScale, 'value', 0.02, 0.8, 0.001).name('Patch Scale');
+fWet.add(soilUniforms.uMoistSeed.value, 'x', -50, 50, 0.1).name('Seed X').listen();
+fWet.add(soilUniforms.uMoistSeed.value, 'y', -50, 50, 0.1).name('Seed Y').listen();
+fWet
+  .add(
+    {
+      randomize: () =>
+        soilUniforms.uMoistSeed.value.set(
+          (Math.random() - 0.5) * 100,
+          (Math.random() - 0.5) * 100
+        ),
+    },
+    'randomize'
+  )
+  .name('🎲 Randomize Seed');
 fWet.add(soilUniforms.uWetDarken, 'value', 0.2, 1, 0.01).name('Wet Darkening');
 fWet.add(soilUniforms.uWetRoughness, 'value', 0.05, 1, 0.01).name('Wet Gloss');
 
@@ -513,6 +571,63 @@ fLook.close();
 fWet.close();
 fCrack.close();
 fSoil.close();
+
+/* --- Grass ----------------------------------------------------------------- */
+const grassParams = { enabled: true, density: 0.3 };
+const fGrass = gui.addFolder('🌱 Grass');
+fGrass
+  .add(grassParams, 'enabled')
+  .name('Enabled')
+  .onChange((v) => (grass.mesh.visible = v));
+fGrass
+  .add(grassParams, 'density', 0, 1, 0.01)
+  .name('Density')
+  .onChange((v) => grass.setDensity(v));
+
+const fGrassMask = fGrass.addFolder('Coverage Mask');
+fGrassMask.add(grass.uniforms.uCoverage, 'value', 0, 1, 0.01).name('Coverage');
+fGrassMask.add(grass.uniforms.uMaskScale, 'value', 0.02, 0.8, 0.001).name('Patch Scale');
+fGrassMask.add(grass.uniforms.uMaskEdge, 'value', 0.001, 0.4, 0.001).name('Patch Softness');
+fGrassMask.add(grass.uniforms.uMaskSeed.value, 'x', -50, 50, 0.1).name('Seed X').listen();
+fGrassMask.add(grass.uniforms.uMaskSeed.value, 'y', -50, 50, 0.1).name('Seed Y').listen();
+fGrassMask
+  .add(
+    {
+      randomize: () =>
+        grass.uniforms.uMaskSeed.value.set(
+          (Math.random() - 0.5) * 100,
+          (Math.random() - 0.5) * 100
+        ),
+    },
+    'randomize'
+  )
+  .name('🎲 Randomize Seed');
+fGrassMask.close();
+
+fGrass.add(grass.uniforms.uHeight, 'value', 0.2, 2.5, 0.01).name('Blade Height');
+fGrass.add(grass.uniforms.uWidth, 'value', 0.02, 0.25, 0.001).name('Blade Width');
+fGrass.add(grass.uniforms.uCurl, 'value', 0, 2.2, 0.01).name('Curl');
+fGrass
+  .addColor({ c: '#33421b' }, 'c')
+  .name('Base Color')
+  .onChange((v) => grass.uniforms.uColorBase.value.set(v));
+fGrass
+  .addColor({ c: '#9bc24a' }, 'c')
+  .name('Tip Color')
+  .onChange((v) => grass.uniforms.uColorTip.value.set(v));
+fGrass.add(grass.uniforms.uColorVarAmt, 'value', 0, 0.6, 0.01).name('Color Variation');
+fGrass.add(grass.uniforms.uTranslucency, 'value', 0, 2, 0.01).name('Translucency');
+fGrass.add(grass.material, 'roughness', 0, 1, 0.01).name('Roughness');
+fGrass.close();
+
+/* --- Wind ------------------------------------------------------------------ */
+const fWind = gui.addFolder('🍃 Wind');
+fWind.add(windState, 'strength', 0, 2, 0.01).name('Strength').onChange(applyWind);
+fWind.add(windState, 'speed', 0, 6, 0.01).name('Speed').onChange(applyWind);
+fWind.add(windState, 'direction', 0, 360, 1).name('Direction °').onChange(applyWind);
+fWind.add(windState, 'scale', 0.05, 1.5, 0.01).name('Gust Size').onChange(applyWind);
+fWind.add(windState, 'gust', 0, 1.5, 0.01).name('Flutter').onChange(applyWind);
+fWind.close();
 
 /* --- Lighting -------------------------------------------------------------- */
 const fLight = gui.addFolder('Lighting');
@@ -532,6 +647,15 @@ fLight.close();
 
 /* --- Cinematic ------------------------------------------------------------- */
 const fCine = gui.addFolder('🎬 Cinematic');
+
+// Anti-aliasing: MSAA happens inside the composer (the renderer's own AA is
+// bypassed by post-processing). Higher = smoother thin grass, a bit more cost.
+const aaParams = { msaa: Math.min(4, fx.maxSamples) };
+const aaOptions = { Off: 0, '2×': 2, '4×': 4, '8×': 8 };
+fCine
+  .add(aaParams, 'msaa', aaOptions)
+  .name('Anti-aliasing')
+  .onChange((v) => fx.setSamples(Number(v)));
 
 const fCam = fCine.addFolder('Camera');
 fCam.add(cine, 'autoOrbit').name('Auto Orbit').onChange((v) => (controls.autoRotate = v));
@@ -584,6 +708,7 @@ renderer.setAnimationLoop(() => {
   shared.uTime.value += dt;
 
   controls.update();
+  grass.update(camera.position);
   updateFocusPlane(dt);
 
   fx.render(dt);

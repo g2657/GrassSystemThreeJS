@@ -68,11 +68,26 @@ const FilmGradeShader = {
   `,
 };
 
-export function createPostFX({ renderer, scene, camera }) {
+export function createPostFX({ renderer, scene, camera, samples = 4 }) {
   const w = window.innerWidth;
   const h = window.innerHeight;
+  const maxSamples = renderer.capabilities.maxSamples; // WebGL2 hardware cap
 
-  const composer = new EffectComposer(renderer);
+  // MSAA can only happen INSIDE the composer — the renderer's own `antialias`
+  // flag is ignored once we render through render targets. So we give the
+  // composer a multisampled float target; `setSamples` rebuilds it on demand.
+  function makeRenderTarget(n) {
+    const dpr = renderer.getPixelRatio();
+    const rt = new THREE.WebGLRenderTarget(
+      Math.floor(window.innerWidth * dpr),
+      Math.floor(window.innerHeight * dpr),
+      { type: THREE.HalfFloatType }
+    );
+    rt.samples = Math.min(n, maxSamples);
+    return rt;
+  }
+
+  const composer = new EffectComposer(renderer, makeRenderTarget(samples));
   composer.addPass(new RenderPass(scene, camera));
 
   const bokeh = new BokehPass(scene, camera, {
@@ -96,12 +111,20 @@ export function createPostFX({ renderer, scene, camera }) {
   }
   setSize(w, h);
 
+  // Swap the composer's ping-pong buffers for ones with a new sample count.
+  function setSamples(n) {
+    composer.reset(makeRenderTarget(n)); // disposes the old targets for us
+    setSize(window.innerWidth, window.innerHeight); // re-sync pass sizes
+  }
+
   return {
     composer,
     bokeh,
     bloom,
     grade,
+    maxSamples,
     setSize,
+    setSamples,
     render(dt) {
       grade.uniforms.uTime.value += dt;
       composer.render();
