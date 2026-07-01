@@ -4,6 +4,7 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import GUI from 'lil-gui';
 import { createPostFX } from './postfx.js';
 import { createGrass } from './grass.js';
+import { createModelSystem } from './model.js';
 
 /* -------------------------------------------------------------------------- */
 /*  Renderer                                                                   */
@@ -91,7 +92,7 @@ scene.add(ambient);
 /* -------------------------------------------------------------------------- */
 /*  Soil texture set (the PBR base the procedural shading sits on top of)      */
 /* -------------------------------------------------------------------------- */
-const SOIL_PREFIX = '/Ground103_1K-JPG_';
+let SOIL_PREFIX = '/Ground103_1K-JPG_'; // swappable in the GUI (Ground072 ↔ Ground103)
 const loader = new THREE.TextureLoader();
 const maxAnisotropy = renderer.capabilities.getMaxAnisotropy();
 
@@ -177,6 +178,64 @@ const soilUniforms = {
   uTime: shared.uTime,
 };
 
+/* -------------------------------------------------------------------------- */
+/*  Moss cover (same principle as the SnowSystem accumulation)                 */
+/* -------------------------------------------------------------------------- */
+//  A world-space FBM mask decides where moss has grown over the soil — exactly
+//  like the snow "settled" mask, but instead of a flat white blanket it lays a
+//  real MOSS TEXTURE (colour, roughness, normal & AO) over the ground and gives
+//  it HEIGHT VOLUME: the moss layer is folded into the shared terrain height
+//  field, so it lifts the geometry (and the grass that sits on it) into a soft,
+//  raised living carpet rather than a painted-on decal.
+//
+//  The height/relief uniforms below are read by the shared `groundHeightAt`
+//  (so the grass follows the moss too); the texture/tint uniforms are read only
+//  by the soil fragment shader.
+const mossUniforms = {
+  // --- Coverage & height volume (folded into groundHeightAt) ---------------
+  uMossEnabled: { value: 0.0 }, // master on/off (0 = no moss anywhere); off by default
+  uMossScale: { value: 0.14 }, // patch noise frequency (smaller = bigger patches)
+  uMossSeed: { value: new THREE.Vector2(4.2, 6.6) }, // pan the moss field
+  uMossCoverage: { value: 0.55 }, // 0 = bare soil, 1 = fully mossed
+  uMossEdge: { value: 0.14 }, // patch edge softness
+  uMossDepth: { value: 0.14 }, // thickness of the moss layer (world units)
+  uMossBumpScale: { value: 0.9 }, // moss surface relief frequency
+  uMossBumpStrength: { value: 0.7 }, // how lumpy the moss carpet is
+  // --- Texture & shading (soil fragment only) ------------------------------
+  uMossMap: { value: null },
+  uMossRoughnessMap: { value: null },
+  uMossNormalMap: { value: null },
+  uMossAoMap: { value: null },
+  uMossColor: { value: new THREE.Color(0xffffff) }, // tint multiplier
+  uMossRoughness: { value: 1.0 }, // scales the sampled moss roughness
+  uMossTextureScale: { value: 0.35 }, // moss tiles per world unit
+  uMossNormalScale: { value: 1.0 }, // moss normal-map strength
+  uMossAoStrength: { value: 1.0 }, // moss ambient-occlusion strength
+};
+
+let mossMaps = []; // rebuilt by loadMossTextures()
+function loadMossTextures() {
+  const make = (suffix) => {
+    const tex = loader.load('/Moss002_1K-JPG_' + suffix + '.jpg');
+    // Sampled through custom uniforms, so tiling is driven by uMossTextureScale
+    // (world-space UVs) rather than the texture's own repeat.
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    tex.anisotropy = maxAnisotropy;
+    return tex;
+  };
+  for (const m of mossMaps) m.dispose();
+  mossUniforms.uMossMap.value = make('Color'); // decoded to linear in-shader
+  mossUniforms.uMossRoughnessMap.value = make('Roughness');
+  mossUniforms.uMossNormalMap.value = make('NormalGL');
+  mossUniforms.uMossAoMap.value = make('AmbientOcclusion');
+  mossMaps = [
+    mossUniforms.uMossMap.value,
+    mossUniforms.uMossRoughnessMap.value,
+    mossUniforms.uMossNormalMap.value,
+    mossUniforms.uMossAoMap.value,
+  ];
+}
+
 // Pure noise helpers (no uniforms).
 const NOISE_FUNCTIONS = /* glsl */ `
 // --- Ashima 2D simplex noise -------------------------------------------------
@@ -229,11 +288,44 @@ uniform float uMoundEdge;
 uniform float uBumpScale;
 uniform float uBumpStrength;
 
+// --- Moss height field (same "settled" principle as the snow accumulation) ---
+uniform float uMossEnabled;
+uniform float uMossScale;
+uniform vec2  uMossSeed;
+uniform float uMossCoverage;
+uniform float uMossEdge;
+uniform float uMossDepth;
+uniform float uMossBumpScale;
+uniform float uMossBumpStrength;
+
+// Where moss has grown: a world-space FBM mask, 0 (bare soil) .. 1 (deep moss).
+// coverage 0 -> nothing, 1 -> everywhere (soft, randomizable patches).
+float mossMaskAt(vec2 worldXZ) {
+  if (uMossEnabled < 0.5) return 0.0;                       // master switch (off)
+  vec2 p = worldXZ * uMossScale + uMossSeed;
+  float n = fbm(p) * 0.5 + 0.5;                            // 0..1
+  float threshold = mix(1.0 + uMossEdge, -uMossEdge, uMossCoverage);
+  return smoothstep(threshold - uMossEdge, threshold + uMossEdge, n);
+}
+
+// Thickness of the moss carpet above the soil, in world units. A base layer
+// scaled by the coverage mask plus lumpy drift detail — the same single source
+// of truth the snow used: the vertex stage lifts the geometry by it and the
+// fragment stage differentiates it for shading, so silhouette and lighting agree.
+float mossHeightAt(vec2 worldXZ) {
+  float mask = mossMaskAt(worldXZ);
+  float drift = fbm(worldXZ * uMossBumpScale + 31.7) * 0.5 + 0.5; // 0..1 lumps
+  float h = mask * (1.0 - 0.4 * uMossBumpStrength + 0.4 * uMossBumpStrength * drift);
+  vec2 edge = smoothstep(10.0, 8.0, abs(worldXZ));          // taper at the rim
+  return uMossDepth * h * edge.x * edge.y;
+}
+
 // Height of the soil surface above the flat plane, in world units. Broad mounds
 // modulated by finer lumps. A coverage mask (driven by the same noise) flattens
 // the low ground first, so lowering coverage leaves only the tallest peaks.
 // Tapered to zero near the plane rim (half-extent 10) so the raised layer never
-// leaves a floating cliff at the border.
+// leaves a floating cliff at the border. The moss carpet is laid on top so the
+// ground (and any grass snapped to it) rises through the moss.
 float groundHeightAt(vec2 worldXZ) {
   vec2 p = worldXZ * uMoundScale + uSeed;
   float base  = fbm(p) * 0.5 + 0.5;                       // 0..1 broad mounds
@@ -242,7 +334,7 @@ float groundHeightAt(vec2 worldXZ) {
   float mThresh = mix(1.0 + uMoundEdge, -uMoundEdge, uMoundCoverage);
   h *= smoothstep(mThresh - uMoundEdge, mThresh + uMoundEdge, base);
   vec2 edge = smoothstep(10.0, 8.0, abs(worldXZ));
-  return uMoundDepth * h * edge.x * edge.y;
+  return uMoundDepth * h * edge.x * edge.y + mossHeightAt(worldXZ);
 }
 `;
 
@@ -265,6 +357,17 @@ uniform float uCrackScale;
 uniform float uReliefShading;
 uniform float uTime;
 
+// Moss shading (albedo/roughness/normal/AO textures + look controls).
+uniform sampler2D uMossMap;
+uniform sampler2D uMossRoughnessMap;
+uniform sampler2D uMossNormalMap;
+uniform sampler2D uMossAoMap;
+uniform vec3  uMossColor;
+uniform float uMossRoughness;
+uniform float uMossTextureScale;
+uniform float uMossNormalScale;
+uniform float uMossAoStrength;
+
 // Analytic surface normal of the displaced ground (for shading the slopes).
 vec3 groundSurfaceNormal(vec2 worldXZ) {
   float e = 0.08;
@@ -279,7 +382,7 @@ vec3 groundSurfaceNormal(vec2 worldXZ) {
 const SOIL_INJECT = NOISE_FUNCTIONS + HEIGHT_FUNCTIONS + SOIL_SHADE_FUNCTIONS;
 
 material.onBeforeCompile = (shader) => {
-  Object.assign(shader.uniforms, soilUniforms);
+  Object.assign(shader.uniforms, soilUniforms, mossUniforms);
 
   // Vertex: inject the field, then raise the ground geometry by it.
   shader.vertexShader = shader.vertexShader
@@ -325,26 +428,42 @@ material.onBeforeCompile = (shader) => {
       // Dry cracks: dark fissures where the noise crosses zero.
       float cr = abs(fbm(sXZ * uCrackScale + 11.0));
       float cracks = (1.0 - smoothstep(0.0, 0.04, cr)) * uCrackAmount;
-      diffuseColor.rgb *= (1.0 - 0.55 * cracks);`
+      diffuseColor.rgb *= (1.0 - 0.55 * cracks);
+
+      // Moss cover: lay the moss albedo (own tiling, tint & AO) over the soil
+      // wherever the mask says it has grown. The moss's HEIGHT is added in the
+      // vertex stage (groundHeightAt), so this only handles the surface look.
+      float mossMask = mossMaskAt(sXZ);
+      vec2  mossUv   = sXZ * uMossTextureScale;
+      vec3  mossAlb  = pow(texture2D(uMossMap, mossUv).rgb, vec3(2.2)) * uMossColor;
+      float mossAo   = mix(1.0, texture2D(uMossAoMap, mossUv).r, uMossAoStrength);
+      mossAlb *= mossAo;
+      diffuseColor.rgb = mix(diffuseColor.rgb, mossAlb, mossMask);`
     )
-    // Wet soil is glossier; cracks read dull and matte.
+    // Wet soil is glossier; cracks read dull and matte; moss carries its own map.
     .replace(
       '#include <roughnessmap_fragment>',
       `#include <roughnessmap_fragment>
       roughnessFactor = mix(roughnessFactor, uWetRoughness, wet);
-      roughnessFactor = mix(roughnessFactor, 1.0, cracks);`
+      roughnessFactor = mix(roughnessFactor, 1.0, cracks);
+      float mossRough = texture2D(uMossRoughnessMap, sXZ * uMossTextureScale).g * uMossRoughness;
+      roughnessFactor = mix(roughnessFactor, clamp(mossRough, 0.04, 1.0), mossMask);`
     )
-    // Shade with the normal of the displaced mounds where the ground rises.
+    // Moss normal-map detail, then the displaced-mound relief normal on top.
     .replace(
       '#include <normal_fragment_maps>',
       `#include <normal_fragment_maps>
+      vec3 mossN = texture2D(uMossNormalMap, sXZ * uMossTextureScale).xyz * 2.0 - 1.0;
+      mossN.xy *= uMossNormalScale;
+      vec3 mossViewN = normalize(tbn * mossN);
+      normal = normalize(mix(normal, mossViewN, mossMask));
       vec3 gN = groundSurfaceNormal(vWorldPosition.xz);
       vec3 gView = normalize((viewMatrix * vec4(gN, 0.0)).xyz);
       normal = normalize(mix(normal, gView, uReliefShading));`
     );
 };
 // Distinct cache key so this program isn't shared with a plain StandardMaterial.
-material.customProgramCacheKey = () => 'soil-v1';
+material.customProgramCacheKey = () => 'soil-moss-v1';
 
 /* -------------------------------------------------------------------------- */
 /*  Ground plane                                                               */
@@ -387,6 +506,7 @@ const GROUND_SIZE = 20; // the 20×20 ground plane; grass + fog box share this
 const grass = createGrass({
   sharedUniforms: shared,
   soilUniforms, // shares the terrain height field (blades follow the mounds)
+  mossUniforms, // moss height is folded into groundHeightAt (blades ride the moss)
   windUniforms,
   noiseGLSL: NOISE_FUNCTIONS,
   heightGLSL: HEIGHT_FUNCTIONS,
@@ -395,6 +515,20 @@ const grass = createGrass({
 });
 grass.mesh.visible = false; // disabled by default (toggle in the Grass folder)
 scene.add(grass.mesh);
+
+/* -------------------------------------------------------------------------- */
+/*  Model (default GLB + user import) — moss accumulates on its upward faces    */
+/* -------------------------------------------------------------------------- */
+const MODELS = {
+  'Rusty Car': '/old_rusty_car_2.glb',
+  'Porsche 911': '/porsche_911.glb',
+};
+const model = createModelSystem({
+  scene,
+  sharedUniforms: shared,
+  mossUniforms, // shares the moss maps, tint & master enable (mosses when moss is on)
+  defaultUrl: MODELS['Rusty Car'],
+});
 
 /* -------------------------------------------------------------------------- */
 /*  Cinematic post-processing & camera                                         */
@@ -507,11 +641,20 @@ function applyTextureScale(scale) {
 
 // Initial build — textures and tiling.
 loadTextures();
+loadMossTextures();
 
 const gui = new GUI({ title: '🪨 Soil Studio' });
 
 /* --- Material -------------------------------------------------------------- */
 const fMat = gui.addFolder('Material');
+const groundParams = { material: 'Ground103' };
+fMat
+  .add(groundParams, 'material', ['Ground072', 'Ground103'])
+  .name('Ground Texture')
+  .onChange((v) => {
+    SOIL_PREFIX = `/${v}_1K-JPG_`;
+    loadTextures(); // rebuilds allMaps and re-applies the current texture scale
+  });
 fMat
   .add(params, 'textureScale', 0.5, 20, 0.1)
   .name('Texture Scale')
@@ -614,6 +757,119 @@ fLook.close();
 fWet.close();
 fCrack.close();
 fSoil.close();
+
+/* --- Moss cover ------------------------------------------------------------ */
+const fMoss = gui.addFolder('🌿 Moss Cover');
+const mossParams = { enabled: false }; // disabled by default
+fMoss
+  .add(mossParams, 'enabled')
+  .name('Enabled')
+  .onChange((v) => (mossUniforms.uMossEnabled.value = v ? 1.0 : 0.0));
+
+const fMossMask = fMoss.addFolder('Coverage Mask');
+fMossMask.add(mossUniforms.uMossCoverage, 'value', 0, 1, 0.01).name('Coverage');
+fMossMask.add(mossUniforms.uMossScale, 'value', 0.02, 0.8, 0.001).name('Patch Scale');
+fMossMask.add(mossUniforms.uMossEdge, 'value', 0.001, 0.4, 0.001).name('Patch Softness');
+fMossMask.add(mossUniforms.uMossSeed.value, 'x', -50, 50, 0.1).name('Seed X').listen();
+fMossMask.add(mossUniforms.uMossSeed.value, 'y', -50, 50, 0.1).name('Seed Y').listen();
+fMossMask
+  .add(
+    {
+      randomize: () =>
+        mossUniforms.uMossSeed.value.set(
+          (Math.random() - 0.5) * 100,
+          (Math.random() - 0.5) * 100
+        ),
+    },
+    'randomize'
+  )
+  .name('🎲 Randomize Seed');
+fMossMask.close();
+
+const fMossVol = fMoss.addFolder('Height Volume');
+fMossVol.add(mossUniforms.uMossDepth, 'value', 0, 1, 0.005).name('Thickness');
+fMossVol.add(mossUniforms.uMossBumpScale, 'value', 0.1, 3, 0.01).name('Relief Scale');
+fMossVol.add(mossUniforms.uMossBumpStrength, 'value', 0, 2, 0.01).name('Relief Strength');
+fMossVol.close();
+
+const fMossLook = fMoss.addFolder('Texture & Shading');
+fMossLook.add(mossUniforms.uMossTextureScale, 'value', 0.05, 2, 0.005).name('Texture Scale');
+fMossLook
+  .addColor({ c: '#ffffff' }, 'c')
+  .name('Moss Tint')
+  .onChange((v) => mossUniforms.uMossColor.value.set(v));
+fMossLook.add(mossUniforms.uMossRoughness, 'value', 0, 2, 0.01).name('Roughness');
+fMossLook.add(mossUniforms.uMossNormalScale, 'value', 0, 3, 0.01).name('Normal Intensity');
+fMossLook.add(mossUniforms.uMossAoStrength, 'value', 0, 2, 0.01).name('AO Intensity');
+fMossLook.close();
+
+fMoss.close();
+
+/* --- Model + moss accumulation --------------------------------------------- */
+const fModel = gui.addFolder('🚗 Model');
+const modelState = { showModel: false };
+fModel
+  .add(modelState, 'showModel')
+  .name('Load Model')
+  .onChange((v) => model.setVisible(v));
+
+const modelSelect = { active: 'Rusty Car' };
+fModel
+  .add(modelSelect, 'active', Object.keys(MODELS))
+  .name('Model')
+  .onChange((k) => model.loadModel(MODELS[k]));
+
+const fileInput = document.getElementById('glb-input');
+fileInput.addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (file) model.importFile(file);
+  fileInput.value = ''; // allow re-importing the same file
+});
+fModel.add({ import: () => fileInput.click() }, 'import').name('📂 Import GLB…');
+
+// Transform — every change re-syncs the world->model matrix so the moss stays put.
+const modelTransform = { scale: 1, posX: 0, posY: 0, posZ: 0, rotY: 0 };
+function applyModelTransform() {
+  model.group.scale.setScalar(modelTransform.scale);
+  model.group.position.set(modelTransform.posX, modelTransform.posY, modelTransform.posZ);
+  model.group.rotation.y = THREE.MathUtils.degToRad(modelTransform.rotY);
+  model.refreshMatrix();
+}
+fModel.add(modelTransform, 'scale', 0.05, 10, 0.01).name('Scale').onChange(applyModelTransform);
+fModel.add(modelTransform, 'posX', -10, 10, 0.01).name('Position X').onChange(applyModelTransform);
+fModel.add(modelTransform, 'posY', -5, 10, 0.01).name('Position Y').onChange(applyModelTransform);
+fModel.add(modelTransform, 'posZ', -10, 10, 0.01).name('Position Z').onChange(applyModelTransform);
+fModel.add(modelTransform, 'rotY', 0, 360, 1).name('Rotation Y°').onChange(applyModelTransform);
+
+const fAccum = fModel.addFolder('Moss Accumulation');
+// The master on/off lives in the Moss Cover folder (uMossEnabled, shared) — the
+// model mosses over exactly when the ground moss is enabled.
+fAccum.add(model.moss.uMossCoverage, 'value', 0, 1, 0.01).name('Coverage');
+fAccum.add(model.moss.uMossThickness, 'value', 0, 0.3, 0.001).name('Thickness');
+fAccum.add(model.moss.uMossScale, 'value', 0.1, 4, 0.01).name('Patch Scale');
+fAccum.add(model.moss.uMossEdge, 'value', 0.01, 0.4, 0.005).name('Patch Softness');
+fAccum.add(model.moss.uMossSeed.value, 'x', -50, 50, 0.1).name('Seed X').listen();
+fAccum.add(model.moss.uMossSeed.value, 'y', -50, 50, 0.1).name('Seed Y').listen();
+fAccum
+  .add(
+    {
+      randomize: () =>
+        model.moss.uMossSeed.value.set(
+          (Math.random() - 0.5) * 100,
+          (Math.random() - 0.5) * 100
+        ),
+    },
+    'randomize'
+  )
+  .name('🎲 Randomize Seed');
+fAccum.add(model.moss.uMossFlatThreshold, 'value', 0, 1, 0.01).name('Flatness Cutoff');
+fAccum.add(model.moss.uMossTexScale, 'value', 0.2, 8, 0.05).name('Texture Scale');
+fAccum.add(model.moss.uMossRoughness, 'value', 0, 2, 0.01).name('Roughness');
+fAccum.add(model.moss.uMossAoStrength, 'value', 0, 2, 0.01).name('AO Intensity');
+fAccum.add(model.moss.uMossBump, 'value', 0, 1.5, 0.01).name('Relief Strength');
+fAccum.add(model.moss.uMossBumpScale, 'value', 0.5, 8, 0.05).name('Relief Scale');
+fAccum.close();
+fModel.close();
 
 /* --- Grass ----------------------------------------------------------------- */
 const grassParams = { enabled: false, density: 0.13 };

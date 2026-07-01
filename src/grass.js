@@ -19,6 +19,7 @@ import * as THREE from 'three';
  * @param {object} o
  * @param {object} o.sharedUniforms  { uTime }
  * @param {object} o.soilUniforms    soil shaping uniforms (by reference)
+ * @param {object} o.mossUniforms    moss uniforms (by reference; height folds into groundHeightAt)
  * @param {object} o.windUniforms    wind uniforms (by reference)
  * @param {string} o.noiseGLSL       NOISE_FUNCTIONS chunk (snoise + fbm)
  * @param {string} o.heightGLSL      HEIGHT_FUNCTIONS chunk (groundHeightAt)
@@ -30,6 +31,7 @@ import * as THREE from 'three';
 export function createGrass({
   sharedUniforms,
   soilUniforms,
+  mossUniforms,
   windUniforms,
   noiseGLSL,
   heightGLSL,
@@ -120,7 +122,9 @@ export function createGrass({
   });
 
   material.onBeforeCompile = (shader) => {
-    Object.assign(shader.uniforms, uniforms, soilUniforms, windUniforms);
+    // moss height uniforms are referenced by the shared groundHeightAt (via
+    // heightGLSL), so bind them too or the blades won't follow the moss layer.
+    Object.assign(shader.uniforms, uniforms, soilUniforms, mossUniforms, windUniforms);
 
     /* ---- Vertex: instancing + terrain snap + curl + wind ----------------- */
     shader.vertexShader = shader.vertexShader
