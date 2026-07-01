@@ -5,6 +5,7 @@ import { BokehPass } from 'three/addons/postprocessing/BokehPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { createClouds } from './clouds.js';
 
 /**
  * Cinematic post-processing stack:
@@ -90,6 +91,11 @@ export function createPostFX({ renderer, scene, camera, samples = 4 }) {
   const composer = new EffectComposer(renderer, makeRenderTarget(samples));
   composer.addPass(new RenderPass(scene, camera));
 
+  // Clouds (see clouds.js): a low-res volumetric raymarch composited at full
+  // res, right after Render so DoF/bloom/grade all affect it.
+  const fog = createClouds({ renderer, scene, camera });
+  composer.addPass(fog.compositePass);
+
   const bokeh = new BokehPass(scene, camera, {
     focus: 9.7,
     aperture: 0.0012,
@@ -108,6 +114,7 @@ export function createPostFX({ renderer, scene, camera, samples = 4 }) {
   function setSize(width, height) {
     composer.setSize(width, height);
     bloom.setSize(width, height);
+    fog.setSize();
   }
   setSize(w, h);
 
@@ -122,11 +129,13 @@ export function createPostFX({ renderer, scene, camera, samples = 4 }) {
     bokeh,
     bloom,
     grade,
+    fog,
     maxSamples,
     setSize,
     setSamples,
     render(dt) {
       grade.uniforms.uTime.value += dt;
+      if (fog.enabled) fog.renderVolume(dt); // low-res raymarch before compositing
       composer.render();
     },
   };

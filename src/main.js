@@ -383,6 +383,7 @@ applyWind();
 /* -------------------------------------------------------------------------- */
 /*  Grass — GPU-instanced, wind-reactive, curlable, glued to the terrain       */
 /* -------------------------------------------------------------------------- */
+const GROUND_SIZE = 20; // the 20×20 ground plane; grass + fog box share this
 const grass = createGrass({
   sharedUniforms: shared,
   soilUniforms, // shares the terrain height field (blades follow the mounds)
@@ -390,7 +391,7 @@ const grass = createGrass({
   noiseGLSL: NOISE_FUNCTIONS,
   heightGLSL: HEIGHT_FUNCTIONS,
   sunLight: keyLight,
-  area: 20, // match the 20×20 ground plane so grass reaches the edges
+  area: GROUND_SIZE, // match the ground plane so grass reaches the edges
 });
 grass.mesh.visible = false; // disabled by default (toggle in the Grass folder)
 scene.add(grass.mesh);
@@ -399,6 +400,11 @@ scene.add(grass.mesh);
 /*  Cinematic post-processing & camera                                         */
 /* -------------------------------------------------------------------------- */
 const fx = createPostFX({ renderer, scene, camera });
+// Point the clouds' in-scattering at the key light.
+fx.fog.uniforms.uSunDir.value.copy(keyLight.position).normalize();
+fx.fog.uniforms.uSunColor.value.copy(keyLight.color);
+// Match the cloud box footprint to the grass/ground (no inset offset).
+fx.fog.uniforms.uHalfXZ.value = GROUND_SIZE / 2;
 
 const cine = {
   autoOrbit: true,
@@ -678,9 +684,65 @@ const fogState = { enabled: true, density: scene.fog.density };
 function applyFog() {
   scene.fog.density = fogState.enabled ? fogState.density : 0;
 }
-fLight.add(fogState, 'enabled').name('Fog').onChange(applyFog);
-fLight.add(fogState, 'density', 0, 0.03, 0.0005).name('Fog Density').onChange(applyFog);
+fLight.add(fogState, 'enabled').name('Atmos Fog').onChange(applyFog);
+fLight.add(fogState, 'density', 0, 0.03, 0.0005).name('Atmos Density').onChange(applyFog);
 fLight.close();
+
+/* --- Clouds (volumetric) --------------------------------------------------- */
+const cloudsParams = { enabled: false, driftDir: 17 };
+const fGFog = gui.addFolder('☁️ Clouds');
+fGFog.add(cloudsParams, 'enabled').name('Enabled').onChange((v) => fx.fog.setEnabled(v));
+
+const fGShape = fGFog.addFolder('Shape');
+fGShape.add(fx.fog.uniforms.uBase, 'value', -3, 20, 0.05).name('Layer Height');
+fGShape.add(fx.fog.uniforms.uHeight, 'value', 0.2, 12, 0.1).name('Thickness');
+fGShape.add(fx.fog.uniforms.uHeightFalloff, 'value', 0, 1, 0.01).name('Ground Hug');
+fGShape.add(fx.fog.uniforms.uDensity, 'value', 0, 8, 0.02).name('Density');
+fGShape.add(fx.fog.uniforms.uCoverage, 'value', 0, 1, 0.01).name('Coverage');
+fGShape.add(fx.fog.uniforms.uCoverageEdge, 'value', 0.01, 0.5, 0.005).name('Billow Softness');
+fGShape.add(fx.fog.uniforms.uNoiseScale, 'value', 0.02, 0.6, 0.005).name('Billow Scale');
+fGShape.add(fx.fog.uniforms.uDetail, 'value', 0, 1, 0.01).name('Detail');
+fGShape.add(fx.fog.uniforms.uDetailScale, 'value', 1, 12, 0.1).name('Detail Scale');
+fGShape.add(fx.fog.uniforms.uEdgeFade, 'value', 0, 6, 0.1).name('Edge Fade');
+
+const fGMove = fGFog.addFolder('Motion');
+fGMove.add(fx.fog.uniforms.uWindSpeed, 'value', 0, 1, 0.005).name('Drift Speed');
+fGMove
+  .add(cloudsParams, 'driftDir', 0, 360, 1)
+  .name('Drift Direction °')
+  .onChange((v) => {
+    const a = THREE.MathUtils.degToRad(v);
+    fx.fog.uniforms.uWindDir.value.set(Math.cos(a), Math.sin(a));
+  });
+
+const fGLight = fGFog.addFolder('Lighting & Color');
+fGLight.add(fx.fog.uniforms.uSunStrength, 'value', 0, 6, 0.02).name('Sun Scatter');
+fGLight.add(fx.fog.uniforms.uAniso, 'value', 0, 0.95, 0.01).name('Backlight (HG)');
+fGLight.add(fx.fog.uniforms.uAmbient, 'value', 0, 1, 0.01).name('Ambient Fill');
+fGLight
+  .addColor({ c: '#cdd6dd' }, 'c')
+  .name('Body Color')
+  .onChange((v) => fx.fog.uniforms.uFogColor.value.set(v));
+fGLight
+  .addColor({ c: '#ffe9c8' }, 'c')
+  .name('Scatter Color')
+  .onChange((v) => fx.fog.uniforms.uSunColor.value.set(v));
+
+const fGPerf = fGFog.addFolder('Quality');
+const fogRes = { scale: 0.5 };
+fGPerf
+  .add(fogRes, 'scale', { Full: 1, Half: 0.5, Quarter: 0.25 })
+  .name('Resolution')
+  .onChange((v) => fx.fog.setScale(Number(v)));
+fGPerf.add(fx.fog.uniforms.uSteps, 'value', 8, 96, 1).name('Steps');
+fGPerf.add(fx.fog.uniforms.uLightSteps, 'value', 0, 8, 1).name('Light Steps');
+fGPerf.add(fx.fog.uniforms.uLightStepSize, 'value', 0.1, 2, 0.05).name('Light Step Size');
+
+fGShape.close();
+fGMove.close();
+fGLight.close();
+fGPerf.close();
+fGFog.close();
 
 /* --- Cinematic ------------------------------------------------------------- */
 const fCine = gui.addFolder('🎬 Cinematic');
