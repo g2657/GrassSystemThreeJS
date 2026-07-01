@@ -87,7 +87,7 @@ export function createGrass({
   geometry.setAttribute('iPhase', new THREE.InstancedBufferAttribute(iPhase, 1));
   geometry.setAttribute('iCurlVar', new THREE.InstancedBufferAttribute(iCurlVar, 1));
   geometry.setAttribute('iColorVar', new THREE.InstancedBufferAttribute(iColorVar, 1));
-  geometry.instanceCount = Math.floor(maxCount * 0.3);
+  geometry.instanceCount = Math.floor(maxCount * 0.13);
   // The blades are placed in world space inside the shader; give a generous
   // bounding sphere so the field is never frustum-culled away.
   geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(), area);
@@ -96,25 +96,25 @@ export function createGrass({
   const uniforms = {
     uTime: sharedUniforms.uTime,
     // --- Coverage mask (where grass grows) ----------------------------------
-    uCoverage: { value: 1.0 }, // 0 = bare, 1 = fully grassed
+    uCoverage: { value: 0.62 }, // 0 = bare, 1 = fully grassed
     uMaskScale: { value: 0.15 }, // patch noise frequency (smaller = bigger patches)
-    uMaskEdge: { value: 0.1 }, // patch edge softness
+    uMaskEdge: { value: 0.251 }, // patch edge softness
     uMaskSeed: { value: new THREE.Vector2(3.7, 9.1) }, // pan the patch field
     // --- Blade look ----------------------------------------------------------
-    uCurl: { value: 0.6 }, // resting tip bend (radians)
-    uHeight: { value: 0.85 }, // blade length (world units)
-    uWidth: { value: 0.09 }, // blade width (world units)
+    uCurl: { value: 1.14 }, // resting tip bend (radians)
+    uHeight: { value: 1.5 }, // blade length (world units)
+    uWidth: { value: 0.049 }, // blade width (world units)
     uColorBase: { value: new THREE.Color(0x33421b) }, // shaded base
     uColorTip: { value: new THREE.Color(0x9bc24a) }, // sunlit tip
-    uColorVarAmt: { value: 0.22 }, // per-blade brightness scatter
-    uTranslucency: { value: 0.6 }, // backlight glow through the blade
+    uColorVarAmt: { value: 0.47 }, // per-blade brightness scatter
+    uTranslucency: { value: 0.61 }, // backlight glow through the blade
     uSunDir: { value: new THREE.Vector3(1, 1, 1).normalize() },
     uCameraPos: { value: new THREE.Vector3() },
   };
 
   const material = new THREE.MeshStandardMaterial({
     color: 0xffffff,
-    roughness: 0.62,
+    roughness: 0.47,
     metalness: 0.0,
     side: THREE.DoubleSide,
   });

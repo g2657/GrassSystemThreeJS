@@ -154,12 +154,17 @@ const soilUniforms = {
   uMoundScale: { value: 0.12 }, // mound noise frequency (smaller = broader)
   uSeed: { value: new THREE.Vector2(8.3, 2.1) }, // pan the whole field
   uMoundDepth: { value: 0.55 }, // height of the mounds (world units)
+  uMoundCoverage: { value: 1.0 }, // how much of the surface is raised
+  uMoundEdge: { value: 0.15 }, // mound coverage edge softness
   uBumpScale: { value: 0.7 }, // fine relief frequency
   uBumpStrength: { value: 0.6 }, // how lumpy the surface is
   // --- Albedo / shading ----------------------------------------------------
   uSoilColor: { value: new THREE.Color(0xffffff) }, // overall tint multiplier
   uVarScale: { value: 0.08 }, // tone-variation frequency
   uVarAmount: { value: 0.28 }, // dry/rich tone contrast
+  uVarCoverage: { value: 1.0 }, // how much of the ground the variation covers
+  uVarEdge: { value: 0.15 }, // variation patch edge softness
+  uVarSeed: { value: new THREE.Vector2(2.0, 7.0) }, // pan the tone field
   uMoisture: { value: 0.0 }, // 0 = bone dry, 1 = soaked (fully covered)
   uMoistScale: { value: 0.18 }, // damp-patch frequency
   uMoistEdge: { value: 0.12 }, // damp-patch edge softness
@@ -219,17 +224,23 @@ const HEIGHT_FUNCTIONS = /* glsl */ `
 uniform float uMoundScale;
 uniform vec2  uSeed;
 uniform float uMoundDepth;
+uniform float uMoundCoverage;
+uniform float uMoundEdge;
 uniform float uBumpScale;
 uniform float uBumpStrength;
 
 // Height of the soil surface above the flat plane, in world units. Broad mounds
-// modulated by finer lumps. Tapered to zero near the plane rim (half-extent 10)
-// so the raised layer never leaves a floating cliff at the border.
+// modulated by finer lumps. A coverage mask (driven by the same noise) flattens
+// the low ground first, so lowering coverage leaves only the tallest peaks.
+// Tapered to zero near the plane rim (half-extent 10) so the raised layer never
+// leaves a floating cliff at the border.
 float groundHeightAt(vec2 worldXZ) {
   vec2 p = worldXZ * uMoundScale + uSeed;
   float base  = fbm(p) * 0.5 + 0.5;                       // 0..1 broad mounds
   float drift = fbm(worldXZ * uBumpScale + uSeed * 0.5) * 0.5 + 0.5;
   float h = base * (1.0 - 0.4 * uBumpStrength + 0.4 * uBumpStrength * drift);
+  float mThresh = mix(1.0 + uMoundEdge, -uMoundEdge, uMoundCoverage);
+  h *= smoothstep(mThresh - uMoundEdge, mThresh + uMoundEdge, base);
   vec2 edge = smoothstep(10.0, 8.0, abs(worldXZ));
   return uMoundDepth * h * edge.x * edge.y;
 }
@@ -240,6 +251,9 @@ const SOIL_SHADE_FUNCTIONS = /* glsl */ `
 uniform vec3  uSoilColor;
 uniform float uVarScale;
 uniform float uVarAmount;
+uniform float uVarCoverage;
+uniform float uVarEdge;
+uniform vec2  uVarSeed;
 uniform float uMoisture;
 uniform float uMoistScale;
 uniform float uMoistEdge;
@@ -292,9 +306,13 @@ material.onBeforeCompile = (shader) => {
       `#include <map_fragment>
       vec2 sXZ = vWorldPosition.xz;
 
-      // Broad dry/rich tone variation so the ground isn't a flat fill.
-      float tone = fbm(sXZ * uVarScale + uSeed * 0.3) * 0.5 + 0.5;
-      diffuseColor.rgb *= mix(1.0 - uVarAmount, 1.0 + uVarAmount, tone);
+      // Broad dry/rich tone variation, confined to a randomizable coverage mask
+      // (coverage 0 -> flat base, 1 -> variation everywhere).
+      float tone = fbm(sXZ * uVarScale + uVarSeed) * 0.5 + 0.5;
+      float tMaskN = fbm(sXZ * uVarScale * 0.7 + uVarSeed + 17.0) * 0.5 + 0.5;
+      float tThresh = mix(1.0 + uVarEdge, -uVarEdge, uVarCoverage);
+      float tMask = smoothstep(tThresh - uVarEdge, tThresh + uVarEdge, tMaskN);
+      diffuseColor.rgb *= mix(1.0, mix(1.0 - uVarAmount, 1.0 + uVarAmount, tone), tMask);
       diffuseColor.rgb *= uSoilColor;
 
       // Moisture: damp patches darken the soil (used again in the rough stage).
@@ -374,6 +392,7 @@ const grass = createGrass({
   sunLight: keyLight,
   area: 20, // match the 20×20 ground plane so grass reaches the edges
 });
+grass.mesh.visible = false; // disabled by default (toggle in the Grass folder)
 scene.add(grass.mesh);
 
 /* -------------------------------------------------------------------------- */
@@ -467,7 +486,7 @@ function updateFocusPlane(dt) {
 /*  GUI controls                                                               */
 /* -------------------------------------------------------------------------- */
 const params = {
-  textureScale: 4, // tiles across the plane
+  textureScale: 2, // tiles across the plane
   normalIntensity: 1.0,
   aoIntensity: 1.0,
   roughnessIntensity: 1.0,
@@ -529,6 +548,8 @@ fShape
   )
   .name('🎲 Randomize Seed');
 fShape.add(soilUniforms.uMoundDepth, 'value', 0, 3, 0.01).name('Mound Height');
+fShape.add(soilUniforms.uMoundCoverage, 'value', 0, 1, 0.01).name('Coverage');
+fShape.add(soilUniforms.uMoundEdge, 'value', 0.001, 0.4, 0.001).name('Coverage Softness');
 fShape.add(soilUniforms.uBumpScale, 'value', 0.1, 3, 0.01).name('Relief Scale');
 fShape.add(soilUniforms.uBumpStrength, 'value', 0, 2, 0.01).name('Relief Strength');
 fShape.add(soilUniforms.uReliefShading, 'value', 0, 1, 0.01).name('Relief Shading');
@@ -540,6 +561,22 @@ fLook
   .onChange((v) => soilUniforms.uSoilColor.value.set(v));
 fLook.add(soilUniforms.uVarAmount, 'value', 0, 1, 0.01).name('Tone Variation');
 fLook.add(soilUniforms.uVarScale, 'value', 0.01, 0.5, 0.001).name('Variation Scale');
+fLook.add(soilUniforms.uVarCoverage, 'value', 0, 1, 0.01).name('Coverage');
+fLook.add(soilUniforms.uVarEdge, 'value', 0.001, 0.4, 0.001).name('Patch Softness');
+fLook.add(soilUniforms.uVarSeed.value, 'x', -50, 50, 0.1).name('Seed X').listen();
+fLook.add(soilUniforms.uVarSeed.value, 'y', -50, 50, 0.1).name('Seed Y').listen();
+fLook
+  .add(
+    {
+      randomize: () =>
+        soilUniforms.uVarSeed.value.set(
+          (Math.random() - 0.5) * 100,
+          (Math.random() - 0.5) * 100
+        ),
+    },
+    'randomize'
+  )
+  .name('🎲 Randomize Seed');
 
 const fWet = fSoil.addFolder('Moisture');
 fWet.add(soilUniforms.uMoisture, 'value', 0, 1, 0.01).name('Coverage');
@@ -573,7 +610,7 @@ fCrack.close();
 fSoil.close();
 
 /* --- Grass ----------------------------------------------------------------- */
-const grassParams = { enabled: true, density: 0.3 };
+const grassParams = { enabled: false, density: 0.13 };
 const fGrass = gui.addFolder('🌱 Grass');
 fGrass
   .add(grassParams, 'enabled')
