@@ -372,7 +372,7 @@ const grass = createGrass({
   noiseGLSL: NOISE_FUNCTIONS,
   heightGLSL: HEIGHT_FUNCTIONS,
   sunLight: keyLight,
-  area: 19,
+  area: 20, // match the 20×20 ground plane so grass reaches the edges
 });
 scene.add(grass.mesh);
 
