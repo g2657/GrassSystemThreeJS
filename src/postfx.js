@@ -20,7 +20,7 @@ const FilmGradeShader = {
     uTime: { value: 0 },
     uVignette: { value: 0.15 },
     uVignetteSize: { value: 0.4 },
-    uGrain: { value: 0.095 },
+    uGrain: { value: 0.0 },
     uChroma: { value: 0.0 },
     uContrast: { value: 1.0 },
     uSaturation: { value: 1.0 },

@@ -172,8 +172,13 @@ const soilUniforms = {
   uMoistSeed: { value: new THREE.Vector2(5.0, 5.0) }, // pan the damp field
   uWetDarken: { value: 0.5 }, // how much wet soil darkens
   uWetRoughness: { value: 0.35 }, // wet soil is glossier
-  uCrackAmount: { value: 0.0 }, // dry-earth fissures
-  uCrackScale: { value: 0.5 }, // crack frequency
+  uCrackEnabled: { value: 0.0 }, // master on/off for the cracks; off by default
+  uCrackAmount: { value: 0.75 }, // dry-earth fissures (0 = none)
+  uCrackScale: { value: 0.9 }, // plate size (bigger = smaller plates)
+  uCrackWidth: { value: 0.06 }, // channel width between plates
+  uCrackWarp: { value: 0.0 }, // organic meander of the plate edges
+  uCrackDepth: { value: 0.7 }, // how deep the fissures groove the surface
+  uCrackSeed: { value: new THREE.Vector2(11.0, 5.0) }, // pan the crack field
   uReliefShading: { value: 0.7 }, // strength of the mound shading normals
   uTime: shared.uTime,
 };
@@ -274,6 +279,31 @@ float fbm(vec2 p) {
   }
   return value;
 }
+
+// --- Cellular (Worley) noise -------------------------------------------------
+// Returns the two nearest feature-point distances (F1, F2). The BORDER between
+// two cells sits where F2-F1 -> 0, which traces the polygonal plate network of
+// cracked, sun-baked soil.
+vec2 hash22(vec2 p) {
+  p = vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)));
+  return fract(sin(p) * 43758.5453123);
+}
+vec2 worleyF1F2(vec2 x) {
+  vec2 n = floor(x);
+  vec2 f = fract(x);
+  float f1 = 8.0, f2 = 8.0;
+  for (int j = -1; j <= 1; j++) {
+    for (int i = -1; i <= 1; i++) {
+      vec2 g = vec2(float(i), float(j));
+      vec2 o = hash22(n + g);           // jittered feature point in the cell
+      vec2 r = g + o - f;
+      float d = dot(r, r);
+      if (d < f1) { f2 = f1; f1 = d; }
+      else if (d < f2) { f2 = d; }
+    }
+  }
+  return vec2(sqrt(f1), sqrt(f2));
+}
 `;
 
 // Terrain height field — SHARED by the soil material AND the grass (so blades
@@ -352,10 +382,32 @@ uniform float uMoistEdge;
 uniform vec2  uMoistSeed;
 uniform float uWetDarken;
 uniform float uWetRoughness;
+uniform float uCrackEnabled;
 uniform float uCrackAmount;
 uniform float uCrackScale;
+uniform float uCrackWidth;
+uniform float uCrackWarp;
+uniform float uCrackDepth;
+uniform vec2  uCrackSeed;
 uniform float uReliefShading;
 uniform float uTime;
+
+// Dry-soil crack network intensity (0 = intact plate .. 1 = deep channel). A
+// warped cellular (Worley) field carves irregular polygonal plates separated by
+// recessed fissures, with a finer second layer subdividing the big plates — the
+// look of cracked, baked earth rather than the thin veins of a frozen lake.
+float soilCrackAt(vec2 xz) {
+  if (uCrackEnabled < 0.5) return 0.0;                      // master switch (off)
+  vec2 warp = vec2(fbm(xz * uCrackScale * 0.5 + uCrackSeed + 3.1),
+                   fbm(xz * uCrackScale * 0.5 + uCrackSeed + 7.7)) * uCrackWarp;
+  vec2 cp = xz * uCrackScale + uCrackSeed + warp;
+  float w = max(uCrackWidth, 0.001);
+  vec2 f = worleyF1F2(cp);
+  float primary = 1.0 - smoothstep(0.0, w, f.y - f.x);
+  vec2 f2 = worleyF1F2(cp * 2.7 + 13.0);
+  float secondary = (1.0 - smoothstep(0.0, w * 1.6, f2.y - f2.x)) * 0.5;
+  return clamp(max(primary, secondary), 0.0, 1.0);
+}
 
 // Moss shading (albedo/roughness/normal/AO textures + look controls).
 uniform sampler2D uMossMap;
@@ -425,10 +477,9 @@ material.onBeforeCompile = (shader) => {
       float wet = smoothstep(wThresh - uMoistEdge, wThresh + uMoistEdge, wn);
       diffuseColor.rgb *= mix(1.0, uWetDarken, wet);
 
-      // Dry cracks: dark fissures where the noise crosses zero.
-      float cr = abs(fbm(sXZ * uCrackScale + 11.0));
-      float cracks = (1.0 - smoothstep(0.0, 0.04, cr)) * uCrackAmount;
-      diffuseColor.rgb *= (1.0 - 0.55 * cracks);
+      // Dry soil cracks: recessed channels of a warped cellular plate network.
+      float cracks = soilCrackAt(sXZ) * uCrackAmount;
+      diffuseColor.rgb *= (1.0 - 0.7 * cracks);
 
       // Moss cover: lay the moss albedo (own tiling, tint & AO) over the soil
       // wherever the mask says it has grown. The moss's HEIGHT is added in the
@@ -459,11 +510,23 @@ material.onBeforeCompile = (shader) => {
       normal = normalize(mix(normal, mossViewN, mossMask));
       vec3 gN = groundSurfaceNormal(vWorldPosition.xz);
       vec3 gView = normalize((viewMatrix * vec4(gN, 0.0)).xyz);
-      normal = normalize(mix(normal, gView, uReliefShading));`
+      normal = normalize(mix(normal, gView, uReliefShading));
+
+      // Crack grooving: tilt the surface into each fissure so the walls catch
+      // light and the plates read as raised, cracked crust (not a flat decal).
+      float ce = 0.02;
+      float c0 = soilCrackAt(sXZ);
+      float cx = soilCrackAt(sXZ + vec2(ce, 0.0));
+      float cz = soilCrackAt(sXZ + vec2(0.0, ce));
+      vec2  cGrad = vec2(cx - c0, cz - c0) / ce;
+      float cDepth = uCrackDepth * uCrackAmount;
+      vec3  crackN = normalize(vec3(-cGrad.x * cDepth, 1.0, -cGrad.y * cDepth));
+      vec3  crackView = normalize((viewMatrix * vec4(crackN, 0.0)).xyz);
+      normal = normalize(mix(normal, crackView, smoothstep(0.02, 0.5, cracks)));`
     );
 };
 // Distinct cache key so this program isn't shared with a plain StandardMaterial.
-material.customProgramCacheKey = () => 'soil-moss-v1';
+material.customProgramCacheKey = () => 'soil-moss-v2';
 
 /* -------------------------------------------------------------------------- */
 /*  Ground plane                                                               */
@@ -749,8 +812,30 @@ fWet.add(soilUniforms.uWetDarken, 'value', 0.2, 1, 0.01).name('Wet Darkening');
 fWet.add(soilUniforms.uWetRoughness, 'value', 0.05, 1, 0.01).name('Wet Gloss');
 
 const fCrack = fSoil.addFolder('Dry Cracks');
+const crackParams = { enabled: false }; // disabled by default
+fCrack
+  .add(crackParams, 'enabled')
+  .name('Enabled')
+  .onChange((v) => (soilUniforms.uCrackEnabled.value = v ? 1.0 : 0.0));
 fCrack.add(soilUniforms.uCrackAmount, 'value', 0, 1, 0.01).name('Crack Amount');
-fCrack.add(soilUniforms.uCrackScale, 'value', 0.1, 3, 0.01).name('Crack Scale');
+fCrack.add(soilUniforms.uCrackScale, 'value', 0.1, 3, 0.01).name('Plate Density');
+fCrack.add(soilUniforms.uCrackWidth, 'value', 0.01, 0.25, 0.001).name('Channel Width');
+fCrack.add(soilUniforms.uCrackWarp, 'value', 0, 2, 0.01).name('Edge Meander');
+fCrack.add(soilUniforms.uCrackDepth, 'value', 0, 2, 0.01).name('Crack Depth');
+fCrack.add(soilUniforms.uCrackSeed.value, 'x', -50, 50, 0.1).name('Seed X').listen();
+fCrack.add(soilUniforms.uCrackSeed.value, 'y', -50, 50, 0.1).name('Seed Y').listen();
+fCrack
+  .add(
+    {
+      randomize: () =>
+        soilUniforms.uCrackSeed.value.set(
+          (Math.random() - 0.5) * 100,
+          (Math.random() - 0.5) * 100
+        ),
+    },
+    'randomize'
+  )
+  .name('🎲 Randomize Seed');
 
 fShape.close();
 fLook.close();
