@@ -712,7 +712,7 @@ const gui = new GUI({ title: '🪨 Soil Studio' });
 const fMat = gui.addFolder('Material');
 const groundParams = { material: 'Ground103' };
 fMat
-  .add(groundParams, 'material', ['Ground072', 'Ground103'])
+  .add(groundParams, 'material', ['Ground048', 'Ground103'])
   .name('Ground Texture')
   .onChange((v) => {
     SOIL_PREFIX = `/${v}_1K-JPG_`;
