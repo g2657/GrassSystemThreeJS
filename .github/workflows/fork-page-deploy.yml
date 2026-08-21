@@ -1,0 +1,67 @@
+name: Deploy GitHub Pages
+# 禁止 on.push：由 Agent 预检通过后 workflow_dispatch，避免写文件就烧 runner
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install
+        run: |
+          if [ -f package-lock.json ]; then npm ci || npm install; else npm install; fi
+      - name: Build
+        run: npm run build -- --base=./
+
+      - name: Resolve artifact dir
+        id: out
+        run: |
+          for d in dist dist build out public docs site .output/public docs/.vitepress/dist .vitepress/dist _fork_page_out; do
+            if [ -d "$d" ]; then
+              # Angular 等可能是 dist/<name>
+              if [ "$d" = "dist" ] && [ -z "$(find dist -maxdepth 1 -name index.html | head -1)" ]; then
+                sub=$(find dist -maxdepth 2 -name index.html | head -1 | xargs dirname)
+                if [ -n "$sub" ]; then
+                  echo "dir=$sub" >> "$GITHUB_OUTPUT"
+                  exit 0
+                fi
+              fi
+              echo "dir=$d" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          html=$(find . -name index.html -not -path './.git/*' -not -path './.github/*' -not -path './node_modules/*' | head -1)
+          if [ -n "$html" ]; then
+            echo "dir=$(dirname "$html")" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "未找到构建产物目录" >&2
+          exit 1
+
+      - name: Adapt asset paths for GitHub Pages
+        continue-on-error: true
+        run: node .github/scripts/fix-pages-base.mjs "${{ steps.out.outputs.dir }}" "/${{ github.event.repository.name }}/"
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ steps.out.outputs.dir }}
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
